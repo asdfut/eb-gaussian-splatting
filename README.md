@@ -12,26 +12,62 @@ alignment and a joint COLMAP bundle adjustment, then trained with [gsplat](https
 ## Results
 
 All models are evaluated on held-out frames (every 8th image). Trained models (`.ply` / `.pt`) and
-fly-through videos are attached to the [Releases](../../releases) page.
+fly-through videos are attached to the [Releases](../../releases) page (v1.0: default strategy,
+v1.1: MCMC).
 
 | Model | Images | Steps | PSNR ↑ | SSIM ↑ | LPIPS ↓ | #Gaussians |
 |---|---|---|---|---|---|---|
 | h1 only (baseline) | 512 | 30k | 26.67 | 0.883 | 0.378 | 0.56 M |
 | Joint h1+h3, 2 fps | 930 | 30k | 27.38 | 0.905 | 0.324 | 0.62 M |
-| **Joint h1+h3, 4 fps** | **1791** | **50k** | **28.34** | **0.909** | **0.313** | **0.81 M** |
+| Joint h1+h3, 4 fps | 1791 | 50k | 28.34 | 0.909 | 0.313 | 0.81 M |
+| **Joint h1+h3, 4 fps, MCMC** | **1791** | **50k** | **30.50** | **0.926** | **0.275** | **1.00 M** |
 
-> The test sets differ between rows (they are drawn from different frame sets), so the numbers are only
-> roughly comparable. The side-by-side comparison below uses near-identical viewpoints (≤ 0.07 s apart).
+> The test sets of the first three rows differ (they are drawn from different frame sets), so those numbers
+> are only roughly comparable. The two 4 fps rows share the **same** test set and are directly comparable.
+> The side-by-side comparison below uses near-identical viewpoints (≤ 0.07 s apart).
 
 **Same-view comparison** — left: ground truth · middle: joint 2 fps · right: joint 4 fps
 
 ![2 fps vs 4 fps](assets/compare_2fps_vs_4fps.jpg)
 
-The 4 fps model is sharper in most views (fire cabinet, stairs, railings). **Known issue:** a large
-floater appears right in front of the camera near the beginning of `h1` (row 1), plus a band artifact on
-the floor (row 2). Likely cause: the robot was nearly stationary at the start, so Gaussians close to the
-lens are seen by too few views to be corrected. Planned fix: `--near-plane 0.3` and/or dropping the
-stationary frames.
+The 4 fps model is sharper in most views (fire cabinet, stairs, railings), but with the default strategy a
+large floater appears in front of the camera near the beginning of `h1` (row 1), plus a band artifact on the
+floor (row 2). A near plane (0.15 m) did **not** fix it. **The MCMC model below removes both.**
+
+## MCMC (3DGS-MCMC)
+
+Same data, test set and 50k steps as the 4 fps default run; only the densification strategy changes
+(`simple_trainer.py mcmc`, `cap_max` 1 M) — **with `--opacity-reg 0.001`** (default 0.01).
+
+**Same views** — left: ground truth · middle: default strategy · right: MCMC
+
+![default vs MCMC](assets/compare_default_vs_mcmc.jpg)
+
+MCMC gains **+2.2 dB PSNR** (28.34 → 30.50) and removes the floater in front of the camera at the start of
+`h1` (row 1) and the floor band (row 2); walls, stairs and whiteboards are also sharper.
+
+### Why gsplat's default MCMC settings collapse on this scene
+
+With the default `opacity_reg 0.01`, training collapses after ~4k steps: renders turn into a single colour
+(`assets/failed_mcmc_default_7k.jpg`) and speed drops from ~30 it/s to 1.4 s/it. The 7k checkpoint shows
+**94 % of the Gaussians "dead"** (opacity < 0.005) and their centres drifted far out of the scene (median
+~57 m, max ~9 km, for a building that is a few tens of metres across). The opacity regulariser pushes most
+Gaussians below the relocation threshold; MCMC then keeps relocating them and injecting position noise
+(which is largest for low-opacity Gaussians), and the chain runs away. The relocation CUDA kernel was checked
+against the closed form of the paper (max error 1e-7), so it is not a hardware/compilation issue on the
+RTX 5060 Ti (sm_120).
+
+Ablation at 7k steps (50k LR schedule, stopped after the 7k evaluation):
+
+| Run | Change vs default MCMC | PSNR | SSIM | LPIPS | |
+|---|---|---|---|---|---|
+| N1 | *default strategy* + `--near-plane 0.02` (≈ 0.15 m) | 24.08 | 0.866 | 0.469 | reference |
+| M1 | `--near-plane 0.02` | 14.87 | 0.779 | 0.675 | collapsed |
+| M2 | `--strategy.noise-lr 5e4` (10× lower) | 15.07 | 0.776 | 0.673 | collapsed later (~6k) |
+| **M3** | **`--opacity-reg 0.001` (10× lower)** | **24.57** | **0.871** | 0.476 | **stable** |
+| M4 | default MCMC on `h1` only (2 fps) | 15.94 | 0.762 | 0.665 | collapsed |
+
+M4 shows that the collapse is not caused by fusing the two sessions.
 
 ### Ablation (4 fps data, 7k steps, one flag changed at a time)
 
@@ -87,6 +123,12 @@ Environment: RTX 5060 Ti 16 GB · PyTorch 2.9.1 + CUDA 12.8 · gsplat 1.5.3 · C
 scripts/run_joint.sh 4 joint4 --max-steps 50000 --eval-steps 7000 30000 50000 \
   --save-steps 30000 50000 --ply-steps 30000 50000 --strategy.refine-stop-iter 25000
 
+# MCMC on the same data (after run_joint.sh has built data/joint4_gs)
+python gsplat/examples/simple_trainer.py mcmc --data-dir data/joint4_gs --data-factor 1 \
+  --result-dir results/joint4_mcmc --disable-viewer --save-ply --max-steps 50000 \
+  --eval-steps 7000 30000 50000 --save-steps 30000 50000 --ply-steps 30000 50000 \
+  --strategy.cap-max 1000000 --opacity-reg 0.001
+
 # Single bag
 scripts/run_scene.sh path/to/bag.mcap h1 2
 ```
@@ -109,7 +151,9 @@ scripts/            pipeline scripts (extraction, ZED→COLMAP, alignment, pairi
 results/
   joint_2fps/       cfg.yml + val/train stats
   joint_4fps/       cfg.yml + val/train stats
+  joint_4fps_mcmc/  cfg.yml + val/train stats (MCMC, best model)
   ablation_4fps_7k/ A–D ablation configs and stats
+  ablation_mcmc_7k/ M1–M4, N1 MCMC stability ablation
   alignment/        h3→h1 rigid transform
 assets/             figures used in this README
 ```

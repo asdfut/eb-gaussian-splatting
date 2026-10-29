@@ -11,24 +11,58 @@ COLMAP 聯合光束法平差（bundle adjustment）融合成同一個場景，�
 ## 結果
 
 所有模型都在保留的測試影像（每 8 張取 1 張）上評估。訓練好的模型（`.ply` / `.pt`）與漫遊影片放在
-[Releases](../../releases) 頁面。
+[Releases](../../releases) 頁面（v1.0：預設策略；v1.1：MCMC）。
 
 | 模型 | 影像數 | 步數 | PSNR ↑ | SSIM ↑ | LPIPS ↓ | 高斯數 |
 |---|---|---|---|---|---|---|
 | 只用 h1（基準） | 512 | 30k | 26.67 | 0.883 | 0.378 | 56 萬 |
 | h1+h3 合併，2 fps | 930 | 30k | 27.38 | 0.905 | 0.324 | 62 萬 |
-| **h1+h3 合併，4 fps** | **1791** | **50k** | **28.34** | **0.909** | **0.313** | **81 萬** |
+| h1+h3 合併，4 fps | 1791 | 50k | 28.34 | 0.909 | 0.313 | 81 萬 |
+| **h1+h3 合併，4 fps，MCMC** | **1791** | **50k** | **30.50** | **0.926** | **0.275** | **100 萬** |
 
-> 各列的測試集不同（取自不同的抽幀集合），數字只能大致比較。下面的並排比較使用幾乎相同的視角
-> （時間差 ≤ 0.07 秒）。
+> 前三列的測試集不同（取自不同的抽幀集合），數字只能大致比較；兩列 4 fps 使用**相同**的測試集，可以
+> 直接比較。下面的並排比較使用幾乎相同的視角（時間差 ≤ 0.07 秒）。
 
 **同視角比較** — 左：真實影像 · 中：合併 2 fps · 右：合併 4 fps
 
 ![2 fps 與 4 fps 比較](assets/compare_2fps_vs_4fps.jpg)
 
-4 fps 模型在大部分視角更清晰（消防箱、樓梯、扶手）。**已知問題：** `h1` 開頭附近的視角，鏡頭正前方
-出現一大塊漂浮物（第 1 列），地板也有一條帶狀假影（第 2 列）。可能原因是機器人開頭幾乎靜止，貼近鏡頭
-的高斯只被很少的視角看到而無法被修正。預計的修法：`--near-plane 0.3`，或刪除靜止段的影像。
+4 fps 模型在大部分視角更清晰（消防箱、樓梯、扶手），但使用預設策略時，`h1` 開頭附近的視角鏡頭正前方
+出現一大塊漂浮物（第 1 列），地板也有一條帶狀假影（第 2 列）。設定 near plane（0.15 m）**沒有**解決。
+**下面的 MCMC 模型把兩者都消除了。**
+
+## MCMC（3DGS-MCMC）
+
+資料、測試集與步數（50k）都和 4 fps 預設策略那一輪相同，只換掉高斯增減策略（`simple_trainer.py mcmc`，
+`cap_max` 100 萬），並**加上 `--opacity-reg 0.001`**（預設是 0.01）。
+
+**同視角比較** — 左：真實影像 · 中：預設策略 · 右：MCMC
+
+![預設策略與 MCMC 比較](assets/compare_default_vs_mcmc.jpg)
+
+MCMC 讓 **PSNR 提高 2.2 dB**（28.34 → 30.50），消除了 `h1` 開頭鏡頭前的漂浮物（第 1 列）和地板帶狀假影
+（第 2 列）；牆面、樓梯與白板也更清晰。
+
+### 為什麼 gsplat 預設的 MCMC 參數在這個場景會崩壞
+
+使用預設的 `opacity_reg 0.01` 時，訓練約在第 4k 步後崩壞：渲染結果變成單一顏色
+（`assets/failed_mcmc_default_7k.jpg`），速度也從約 30 it/s 掉到 1.4 秒一步。檢查第 7k 步的 checkpoint：
+**94% 的高斯已經「死亡」**（不透明度 < 0.005），而且中心點漂離場景（中位數約 57 m、最遠約 9 km，但建築本身
+只有幾十公尺大）。不透明度正則把大多數高斯壓到重新定位門檻以下；MCMC 不斷重新定位它們並注入位置雜訊
+（不透明度越低雜訊越大），最後整個鏈失控。重新定位用的 CUDA kernel 已和論文的封閉解比對過（最大誤差
+1e-7），所以不是 RTX 5060 Ti（sm_120）的硬體或編譯問題。
+
+7k 步消融實驗（沿用 50k 的學習率排程，第 7k 步評估後停止）：
+
+| 實驗 | 相對預設 MCMC 的改動 | PSNR | SSIM | LPIPS | |
+|---|---|---|---|---|---|
+| N1 | *預設策略* + `--near-plane 0.02`（約 0.15 m） | 24.08 | 0.866 | 0.469 | 對照組 |
+| M1 | `--near-plane 0.02` | 14.87 | 0.779 | 0.675 | 崩壞 |
+| M2 | `--strategy.noise-lr 5e4`（降 10 倍） | 15.07 | 0.776 | 0.673 | 較晚崩壞（約 6k） |
+| **M3** | **`--opacity-reg 0.001`（降 10 倍）** | **24.57** | **0.871** | 0.476 | **穩定** |
+| M4 | 只用 `h1`（2 fps）的預設 MCMC | 15.94 | 0.762 | 0.665 | 崩壞 |
+
+M4 顯示崩壞和合併兩段錄影無關。
 
 ### 消融實驗（4 fps 資料、7k 步、每次只改一個參數）
 
@@ -82,6 +116,12 @@ ROS 2 bag (.mcap)
 scripts/run_joint.sh 4 joint4 --max-steps 50000 --eval-steps 7000 30000 50000 \
   --save-steps 30000 50000 --ply-steps 30000 50000 --strategy.refine-stop-iter 25000
 
+# 在同一份資料上跑 MCMC（需先由 run_joint.sh 建好 data/joint4_gs）
+python gsplat/examples/simple_trainer.py mcmc --data-dir data/joint4_gs --data-factor 1 \
+  --result-dir results/joint4_mcmc --disable-viewer --save-ply --max-steps 50000 \
+  --eval-steps 7000 30000 50000 --save-steps 30000 50000 --ply-steps 30000 50000 \
+  --strategy.cap-max 1000000 --opacity-reg 0.001
+
 # 單一 bag
 scripts/run_scene.sh path/to/bag.mcap h1 2
 ```
@@ -104,7 +144,9 @@ scripts/            流程腳本（抽幀、ZED→COLMAP、對齊、配對、訓
 results/
   joint_2fps/       cfg.yml 與驗證/訓練統計
   joint_4fps/       cfg.yml 與驗證/訓練統計
+  joint_4fps_mcmc/  cfg.yml 與驗證/訓練統計（MCMC，最佳模型）
   ablation_4fps_7k/ A–D 消融實驗的設定與統計
+  ablation_mcmc_7k/ M1–M4、N1 MCMC 穩定性消融實驗
   alignment/        h3→h1 剛體轉換
 assets/             README 使用的圖片
 ```
