@@ -13,7 +13,7 @@ alignment and a joint COLMAP bundle adjustment, then trained with [gsplat](https
 
 All models are evaluated on held-out frames (every 8th image). Trained models (`.ply` / `.pt`) and
 fly-through videos are attached to the [Releases](../../releases) page (v1.0: default strategy,
-v1.1: MCMC, v1.2: collision map / LiDAR point cloud).
+v1.1: MCMC, v1.2: collision map / LiDAR point cloud, v1.3: splat USD for Isaac Sim).
 
 | Model | Images | Steps | PSNR ↑ | SSIM ↑ | LPIPS ↓ | #Gaussians |
 |---|---|---|---|---|---|---|
@@ -33,6 +33,21 @@ v1.1: MCMC, v1.2: collision map / LiDAR point cloud).
 The 4 fps model is sharper in most views (fire cabinet, stairs, railings), but with the default strategy a
 large floater appears in front of the camera near the beginning of `h1` (row 1), plus a band artifact on the
 floor (row 2). A near plane (0.15 m) did **not** fix it. **The MCMC model below removes both.**
+
+### Ablation (4 fps data, 7k steps, one flag changed at a time)
+
+| Run | Flag | PSNR | SSIM | LPIPS |
+|---|---|---|---|---|
+| A | default | **25.23** | **0.885** | **0.398** |
+| B | `--pose-opt` | 25.11 | 0.883 | 0.403 |
+| C | `--app-opt` | 24.89 | 0.883 | 0.405 |
+| D | `--strategy.absgrad --strategy.grow-grad2d 6e-4` | 22.59 | 0.859 | 0.457 |
+
+A first "improved" run that combined `pose_opt + app_opt + absgrad + bilateral grid` collapsed
+(PSNR 20.7 at 7k, large floaters — see `assets/failed_absgrad_combo_7k.jpg`). The ablation shows **absgrad
+is the culprit** on this low-texture scene; `pose_opt` / `app_opt` bring no gain because the joint BA poses
+are already accurate and exposure is consistent across the two sessions. The bilateral grid was dropped for
+speed: its TV regulariser runs over every image's grid each step (~190 ms/step with 1791 images).
 
 ## MCMC (3DGS-MCMC)
 
@@ -68,21 +83,6 @@ Ablation at 7k steps (50k LR schedule, stopped after the 7k evaluation):
 | M4 | default MCMC on `h1` only (2 fps) | 15.94 | 0.762 | 0.665 | collapsed |
 
 M4 shows that the collapse is not caused by fusing the two sessions.
-
-### Ablation (4 fps data, 7k steps, one flag changed at a time)
-
-| Run | Flag | PSNR | SSIM | LPIPS |
-|---|---|---|---|---|
-| A | default | **25.23** | **0.885** | **0.398** |
-| B | `--pose-opt` | 25.11 | 0.883 | 0.403 |
-| C | `--app-opt` | 24.89 | 0.883 | 0.405 |
-| D | `--strategy.absgrad --strategy.grow-grad2d 6e-4` | 22.59 | 0.859 | 0.457 |
-
-A first "improved" run that combined `pose_opt + app_opt + absgrad + bilateral grid` collapsed
-(PSNR 20.7 at 7k, large floaters — see `assets/failed_absgrad_combo_7k.jpg`). The ablation shows **absgrad
-is the culprit** on this low-texture scene; `pose_opt` / `app_opt` bring no gain because the joint BA poses
-are already accurate and exposure is consistent across the two sessions. The bilateral grid was dropped for
-speed: its TV regulariser runs over every image's grid each step (~190 ms/step with 1791 images).
 
 ## Collision map (for simulation)
 
@@ -142,6 +142,65 @@ doors and stairs line up with the images, i.e. the mesh is registered to the cam
 - Some walls still show a few-cm double surface from residual misalignment; fine for collision,
   not for precise measurement.
 - A faint ghost of the operator may remain where they stood still for a long time.
+
+## Isaac Lab example: Gaussian splat visual + collision mesh
+
+[`isaac/`](isaac/) loads the corridor in Isaac Lab with the **MCMC Gaussian splat as the visual** (rendered
+natively by Isaac Sim as a USD `ParticleField3DGaussianSplat`) and the **LiDAR mesh as the collider**, in
+one frame (metres, Z up, floor at z = 0). Tested with Isaac Sim 6.1 and Isaac Lab 3.0 (EA) on an RTX 5060 Ti.
+
+```bash
+# 1) get the splat USD (237 MB) from Release v1.3 into isaac/
+gh release download v1.3 -R asdfut/eb-gaussian-splatting -p corridor_splat_gsframe.usdc -D isaac
+
+# 2) run (inside the Isaac Lab python environment)
+cd isaac
+python load_corridor_scene.py --viz kit              # interactive window
+python load_corridor_scene.py --save_dir renders/    # headless: collision check + RGB renders
+#   --show_collision  draw the collision mesh   --render_frames N  RTX accumulation per view (default 64)
+#   --num_objects N   balls dropped on the floor --num_views N     views rendered per recording
+```
+
+The script drops balls along the robot path and checks they come to rest on the floor, then renders
+camera views at recorded ZED poses (same intrinsics). Expected output:
+
+```
+[corridor] gaussian splat prims: ['/World/Corridor/Splat/gaussians'] (1000000 splats) | rtx/rendermode = RealTimePathTracing
+[corridor] collision check: 10/10 balls resting on the floor (z ~ 0.1 m)
+```
+
+![Isaac Sim render vs photo](assets/isaac_render_vs_photo.jpg)
+
+*Left: Isaac Sim render (splat + red test balls resting on the collision floor). Right: the real photo
+from the same pose. Rendered with `--render_frames 256`.*
+
+| File | Description |
+|---|---|
+| `isaac/corridor_scene.usda` | Scene: `/Corridor/Collision` (→ `../collision/collision_mesh.usd`, invisible but colliding) + `/Corridor/Splat` (Xform with `inv(T_gsplat_from_sim)`, scale 7.29) / `gaussians` (→ splat USD) |
+| `isaac/corridor_scene.usda.views.json` | Recorded camera poses (eye / target) in the scene frame, used for spawn points and renders |
+| `isaac/load_corridor_scene.py` | Isaac Lab loader / collision check / renderer |
+| `isaac/make_scene_usd.py` | Rebuilds `corridor_scene.usda` (run with an interpreter that has `pxr`) |
+| Release v1.3: `corridor_splat_gsframe.usdc` | MCMC model (1 M Gaussians) converted with NVIDIA's `omni.kit.converter.gsplat`, in gsplat's normalized frame |
+
+**Things that matter (each one cost a debugging round):**
+
+- Gaussians are drawn only in **RTX Real-Time 2.0** (`--/rtx/rendermode=RealTimePathTracing`); Isaac Lab's default
+  `RaytracedLighting` shows nothing. Isaac Sim's NuRec code also requires `--/renderer/multiGpu/enabled=false`.
+  The script passes both through `--kit_args`.
+- In the scene USD the splat reference sits on a **typeless child prim**. Putting it directly on the `Xform` that
+  carries the transform makes the local `Xform` type win over `ParticleField3DGaussianSplat`, and nothing renders.
+- The splat is placed with a transform instead of baking it into the data, which would also require rotating
+  every spherical-harmonics coefficient.
+- Path-traced splats are grainier than gsplat's rasterizer; raise `--render_frames` for cleaner images.
+- The floor plane is flat, while the reconstruction drifts slightly in height: the splat floor is within ~8 cm of
+  z = 0 almost everywhere, and up to ~15 cm below it near the start of `h1`.
+
+To convert another `.ply` (standard 3DGS layout, e.g. any gsplat export):
+
+```bash
+PYTHONPATH=<isaacsim>/extscache/omni.kit.converter.gsplat-*/pip_prebundle \
+  python -m usd_convert_gsplat -i point_cloud.ply -o splat.usdc --up-axis Z
+```
 
 ## Pipeline
 
@@ -215,5 +274,6 @@ results/
   ablation_mcmc_7k/ M1–M4, N1 MCMC stability ablation
   alignment/        h3→h1 rigid transform
 collision/          collision mesh (USD / OBJ), floor, frame transforms, stats
+isaac/              Isaac Lab scene (splat visual + collision) and loader
 assets/             figures used in this README
 ```

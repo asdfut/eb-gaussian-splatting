@@ -11,7 +11,7 @@ COLMAP 聯合光束法平差（bundle adjustment）融合成同一個場景，�
 ## 結果
 
 所有模型都在保留的測試影像（每 8 張取 1 張）上評估。訓練好的模型（`.ply` / `.pt`）與漫遊影片放在
-[Releases](../../releases) 頁面（v1.0：預設策略；v1.1：MCMC；v1.2：碰撞地圖 / LiDAR 點雲）。
+[Releases](../../releases) 頁面（v1.0：預設策略；v1.1：MCMC；v1.2：碰撞地圖 / LiDAR 點雲；v1.3：Isaac Sim 用的潑濺 USD）。
 
 | 模型 | 影像數 | 步數 | PSNR ↑ | SSIM ↑ | LPIPS ↓ | 高斯數 |
 |---|---|---|---|---|---|---|
@@ -30,6 +30,20 @@ COLMAP 聯合光束法平差（bundle adjustment）融合成同一個場景，�
 4 fps 模型在大部分視角更清晰（消防箱、樓梯、扶手），但使用預設策略時，`h1` 開頭附近的視角鏡頭正前方
 出現一大塊漂浮物（第 1 列），地板也有一條帶狀假影（第 2 列）。設定 near plane（0.15 m）**沒有**解決。
 **下面的 MCMC 模型把兩者都消除了。**
+
+### 消融實驗（4 fps 資料、7k 步、每次只改一個參數）
+
+| 實驗 | 參數 | PSNR | SSIM | LPIPS |
+|---|---|---|---|---|
+| A | 預設 | **25.23** | **0.885** | **0.398** |
+| B | `--pose-opt` | 25.11 | 0.883 | 0.403 |
+| C | `--app-opt` | 24.89 | 0.883 | 0.405 |
+| D | `--strategy.absgrad --strategy.grow-grad2d 6e-4` | 22.59 | 0.859 | 0.457 |
+
+第一次「改進版」同時開了 `pose_opt + app_opt + absgrad + bilateral grid`，結果崩壞（7k 步 PSNR 20.7、
+大量漂浮物，見 `assets/failed_absgrad_combo_7k.jpg`）。消融實驗顯示，在這個低紋理場景中 **absgrad 是元兇**；
+`pose_opt` / `app_opt` 沒有幫助，因為聯合 BA 後的位姿已經很準，兩段錄影的曝光也一致。bilateral grid 因為
+速度被拿掉：它的 TV 正則項每一步都會對全部影像的網格計算（1791 張時約 190 ms/步）。
 
 ## MCMC（3DGS-MCMC）
 
@@ -63,20 +77,6 @@ MCMC 讓 **PSNR 提高 2.2 dB**（28.34 → 30.50），消除了 `h1` 開頭鏡�
 | M4 | 只用 `h1`（2 fps）的預設 MCMC | 15.94 | 0.762 | 0.665 | 崩壞 |
 
 M4 顯示崩壞和合併兩段錄影無關。
-
-### 消融實驗（4 fps 資料、7k 步、每次只改一個參數）
-
-| 實驗 | 參數 | PSNR | SSIM | LPIPS |
-|---|---|---|---|---|
-| A | 預設 | **25.23** | **0.885** | **0.398** |
-| B | `--pose-opt` | 25.11 | 0.883 | 0.403 |
-| C | `--app-opt` | 24.89 | 0.883 | 0.405 |
-| D | `--strategy.absgrad --strategy.grow-grad2d 6e-4` | 22.59 | 0.859 | 0.457 |
-
-第一次「改進版」同時開了 `pose_opt + app_opt + absgrad + bilateral grid`，結果崩壞（7k 步 PSNR 20.7、
-大量漂浮物，見 `assets/failed_absgrad_combo_7k.jpg`）。消融實驗顯示，在這個低紋理場景中 **absgrad 是元兇**；
-`pose_opt` / `app_opt` 沒有幫助，因為聯合 BA 後的位姿已經很準，兩段錄影的曝光也一致。bilateral grid 因為
-速度被拿掉：它的 TV 正則項每一步都會對全部影像的網格計算（1791 張時約 190 ms/步）。
 
 ## 碰撞地圖（給模擬用）
 
@@ -135,6 +135,64 @@ M4 顯示崩壞和合併兩段錄影無關。
 - 地板是理想化的平面，地面上的坡道或台階沒有建模（樓梯有，來自 LiDAR）。
 - 部分牆面因為殘留的對齊誤差，仍有幾公分的雙層表面；用於碰撞沒問題，但不適合精確量測。
 - 操作人員長時間站著不動的地方，可能還留有淡淡的殘影。
+
+## Isaac Lab 範例：高斯潑濺外觀 + 碰撞網格
+
+[`isaac/`](isaac/) 會在 Isaac Lab 裡載入走廊場景：**MCMC 高斯潑濺當外觀**（Isaac Sim 直接以 USD
+`ParticleField3DGaussianSplat` 渲染），**LiDAR 網格當碰撞體**，兩者在同一個座標系（公尺、Z 軸朝上、地板在
+z = 0）。已在 RTX 5060 Ti 上用 Isaac Sim 6.1 與 Isaac Lab 3.0（EA）測試。
+
+```bash
+# 1) 從 Release v1.3 下載潑濺的 USD（237 MB）到 isaac/
+gh release download v1.3 -R asdfut/eb-gaussian-splatting -p corridor_splat_gsframe.usdc -D isaac
+
+# 2) 執行（在 Isaac Lab 的 python 環境中）
+cd isaac
+python load_corridor_scene.py --viz kit              # 互動視窗
+python load_corridor_scene.py --save_dir renders/    # 無視窗：碰撞檢查 + RGB 渲染
+#   --show_collision  顯示碰撞網格             --render_frames N  每個視角的 RTX 累積幀數（預設 64）
+#   --num_objects N   掉落到地板上的球數量      --num_views N     每段錄影要渲染的視角數
+```
+
+腳本會沿著機器人路徑丟下幾顆球，確認它們都停在地板上，接著在 ZED 錄影時的相機位姿（相同內參）渲染畫面。
+預期輸出：
+
+```
+[corridor] gaussian splat prims: ['/World/Corridor/Splat/gaussians'] (1000000 splats) | rtx/rendermode = RealTimePathTracing
+[corridor] collision check: 10/10 balls resting on the floor (z ~ 0.1 m)
+```
+
+![Isaac Sim 渲染與實拍比較](assets/isaac_render_vs_photo.jpg)
+
+*左：Isaac Sim 的渲染（高斯潑濺 + 停在碰撞地板上的紅色測試球）。右：同一位姿的實拍照片。
+使用 `--render_frames 256` 渲染。*
+
+| 檔案 | 說明 |
+|---|---|
+| `isaac/corridor_scene.usda` | 場景：`/Corridor/Collision`（→ `../collision/collision_mesh.usd`，不顯示但有碰撞）+ `/Corridor/Splat`（帶 `inv(T_gsplat_from_sim)` 的 Xform，縮放 7.29）/ `gaussians`（→ 潑濺 USD） |
+| `isaac/corridor_scene.usda.views.json` | 場景座標系中錄影時的相機位姿（eye / target），用來決定球的位置與渲染視角 |
+| `isaac/load_corridor_scene.py` | Isaac Lab 載入 / 碰撞檢查 / 渲染腳本 |
+| `isaac/make_scene_usd.py` | 重新產生 `corridor_scene.usda`（需要有 `pxr` 的 Python） |
+| Release v1.3：`corridor_splat_gsframe.usdc` | MCMC 模型（100 萬個高斯），用 NVIDIA 的 `omni.kit.converter.gsplat` 轉換，位在 gsplat 的正規化座標系 |
+
+**要注意的地方（每一項都是除錯時踩過的坑）：**
+
+- 高斯只會在 **RTX Real-Time 2.0**（`--/rtx/rendermode=RealTimePathTracing`）下顯示；Isaac Lab 預設的
+  `RaytracedLighting` 什麼都看不到。Isaac Sim 的 NuRec 程式也要求 `--/renderer/multiGpu/enabled=false`。
+  腳本會透過 `--kit_args` 自動帶入這兩個設定。
+- 場景 USD 裡，潑濺的 reference 放在一個**沒有型別的子 prim** 上。如果直接放在帶轉換矩陣的 `Xform` 上，
+  本地的 `Xform` 型別會蓋過 `ParticleField3DGaussianSplat`，結果什麼都不會渲染。
+- 潑濺是用轉換矩陣擺放，而不是把轉換寫進資料裡；後者還得旋轉每一個球諧係數。
+- 路徑追蹤渲染的潑濺比 gsplat 的光柵化結果顆粒感重；提高 `--render_frames` 可以讓畫面更乾淨。
+- 地板是平面，但重建本身有輕微的高度漂移：潑濺的地板在大部分區域和 z = 0 相差 8 cm 以內，
+  只有 `h1` 開頭附近最多低了約 15 cm。
+
+轉換其他 `.ply`（標準 3DGS 格式，例如任何 gsplat 匯出的檔案）：
+
+```bash
+PYTHONPATH=<isaacsim>/extscache/omni.kit.converter.gsplat-*/pip_prebundle \
+  python -m usd_convert_gsplat -i point_cloud.ply -o splat.usdc --up-axis Z
+```
 
 ## 流程
 
@@ -207,5 +265,6 @@ results/
   ablation_mcmc_7k/ M1–M4、N1 MCMC 穩定性消融實驗
   alignment/        h3→h1 剛體轉換
 collision/          碰撞網格（USD / OBJ）、地板、座標轉換、統計
+isaac/              Isaac Lab 場景（潑濺外觀 + 碰撞）與載入腳本
 assets/             README 使用的圖片
 ```
