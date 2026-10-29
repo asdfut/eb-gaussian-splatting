@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.ply
+*.pt
+*.mcap
+*.db
