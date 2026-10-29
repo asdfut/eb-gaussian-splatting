@@ -11,7 +11,7 @@ COLMAP 聯合光束法平差（bundle adjustment）融合成同一個場景，�
 ## 結果
 
 所有模型都在保留的測試影像（每 8 張取 1 張）上評估。訓練好的模型（`.ply` / `.pt`）與漫遊影片放在
-[Releases](../../releases) 頁面（v1.0：預設策略；v1.1：MCMC；v1.2：碰撞地圖 / LiDAR 點雲；v1.3：Isaac Sim 用的潑濺 USD）。
+[Releases](../../releases) 頁面（v1.0：預設策略；v1.1：MCMC；v1.2：碰撞地圖 / LiDAR 點雲；v1.3：Isaac Sim 用的潑濺 USD；v1.4：MCMC + 3DGUT）。
 
 | 模型 | 影像數 | 步數 | PSNR ↑ | SSIM ↑ | LPIPS ↓ | 高斯數 |
 |---|---|---|---|---|---|---|
@@ -152,6 +152,8 @@ python load_corridor_scene.py --viz kit              # 互動視窗
 python load_corridor_scene.py --save_dir renders/    # 無視窗：碰撞檢查 + RGB 渲染
 #   --show_collision  顯示碰撞網格             --render_frames N  每個視角的 RTX 累積幀數（預設 64）
 #   --num_objects N   掉落到地板上的球數量      --num_views N     每段錄影要渲染的視角數
+#   --scene corridor_scene_ut.usda  改用 3DGUT 模型（先從 v1.4 下載 corridor_splat_ut_gsframe.usdc）
+#   --views my_views.json           渲染自訂的 eye/target 相機位姿
 ```
 
 腳本會沿著機器人路徑丟下幾顆球，確認它們都停在地板上，接著在 ZED 錄影時的相機位姿（相同內參）渲染畫面。
@@ -174,6 +176,7 @@ python load_corridor_scene.py --save_dir renders/    # 無視窗：碰撞檢查 
 | `isaac/load_corridor_scene.py` | Isaac Lab 載入 / 碰撞檢查 / 渲染腳本 |
 | `isaac/make_scene_usd.py` | 重新產生 `corridor_scene.usda`（需要有 `pxr` 的 Python） |
 | Release v1.3：`corridor_splat_gsframe.usdc` | MCMC 模型（100 萬個高斯），用 NVIDIA 的 `omni.kit.converter.gsplat` 轉換，位在 gsplat 的正規化座標系 |
+| `isaac/corridor_scene_ut.usda` + Release v1.4：`corridor_splat_ut_gsframe.usdc` | 同一個場景，改用 MCMC + 3DGUT 模型（見下方實驗） |
 
 **要注意的地方（每一項都是除錯時踩過的坑）：**
 
@@ -183,9 +186,35 @@ python load_corridor_scene.py --save_dir renders/    # 無視窗：碰撞檢查 
 - 場景 USD 裡，潑濺的 reference 放在一個**沒有型別的子 prim** 上。如果直接放在帶轉換矩陣的 `Xform` 上，
   本地的 `Xform` 型別會蓋過 `ParticleField3DGaussianSplat`，結果什麼都不會渲染。
 - 潑濺是用轉換矩陣擺放，而不是把轉換寫進資料裡；後者還得旋轉每一個球諧係數。
+- ZED 的主點比影像中心低 7 px，但 **Omniverse 會忽略相機的 aperture offset**（Isaac Lab 會顯示警告）。
+  載入腳本因此多渲染 14 行、讓主點落在中心，再裁掉下方只留上面 720 行；這讓渲染和實拍照片比較的 PSNR
+  提高了約 1.3 dB。
 - 路徑追蹤渲染的潑濺比 gsplat 的光柵化結果顆粒感重；提高 `--render_frames` 可以讓畫面更乾淨。
 - 地板是平面，但重建本身有輕微的高度漂移：潑濺的地板在大部分區域和 z = 0 相差 8 cm 以內，
   只有 `h1` 開頭附近最多低了約 15 cm。
+
+### 實驗：為 Isaac 的光線追蹤渲染器改用 3DGUT 訓練
+
+Isaac Sim 是沿著光線在 3D 中評估高斯，而 gsplat 預設是投影到 2D 再光柵化來訓練。為了讓訓練方式和渲染器
+一致，用 gsplat 的 3DGUT 模式（`--with-ut --with-eval3d`，其他設定完全相同）重新訓練 MCMC 模型。
+必須加上 `--disable-video`：gsplat 的 3D 評估只支援 RGB，RGB+深度的軌跡影片渲染會直接中止。
+
+| 4 fps、MCMC、50k 步 | gsplat 評估 PSNR / SSIM / LPIPS | Isaac 渲染對實拍照片（8 個錄影視角）PSNR / SSIM |
+|---|---|---|
+| MCMC（v1.1） | **30.50** / 0.926 / **0.275** | **23.88** / **0.741** |
+| MCMC + 3DGUT（v1.4） | 30.28 / 0.925 / 0.279 | 23.47 / 0.729 |
+
+![Isaac Sim 中 MCMC 與 3DGUT 的比較](assets/isaac_mcmc_vs_3dgut.jpg)
+
+*Isaac Sim 渲染（256 幀）。第 1–2 列：錄影視角與實拍照片。第 3–5 列：偏離軌跡的視角（高 0.6 m、朝牆面
+轉 ±60°），這些視角沒有實拍照片。*
+
+**結論：沒有明顯改善。** 3DGUT 在 gsplat 裡和原本差不多，在 Isaac 的錄影視角反而低了 0.4 dB；偏離軌跡時，
+有些視角比較乾淨（第 3、5 列），有些地板上的雜點反而更多（第 1 列）。因此預設場景仍使用 MCMC 模型；
+3DGUT 版本可用 `isaac/corridor_scene_ut.usda` 載入（潑濺 USD 在 Release v1.4）。
+和 gsplat 自己的渲染相比仍有差距（約 24 對 30 dB），來自 Isaac 用路徑追蹤渲染高斯所產生的雜訊與雜點；
+而偏離軌跡時的模糊來自資料本身（只有兩種相機高度、都沿著走廊往前看），需要補拍更多視角或加入幾何監督
+（例如 LiDAR 深度），換渲染器無法解決。
 
 轉換其他 `.ply`（標準 3DGS 格式，例如任何 gsplat 匯出的檔案）：
 
@@ -261,6 +290,7 @@ results/
   joint_2fps/       cfg.yml 與驗證/訓練統計
   joint_4fps/       cfg.yml 與驗證/訓練統計
   joint_4fps_mcmc/  cfg.yml 與驗證/訓練統計（MCMC，最佳模型）
+  joint_4fps_mcmc_ut/ cfg.yml 與驗證/訓練統計（MCMC + 3DGUT）
   ablation_4fps_7k/ A–D 消融實驗的設定與統計
   ablation_mcmc_7k/ M1–M4、N1 MCMC 穩定性消融實驗
   alignment/        h3→h1 剛體轉換

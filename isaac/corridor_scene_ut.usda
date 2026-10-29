@@ -1,0 +1,35 @@
+#usda 1.0
+(
+    defaultPrim = "Corridor"
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+
+def Xform "Corridor"
+{
+    def "Collision" (
+        prepend references = @../collision/collision_mesh.usd@
+    )
+    {
+        over "Corridor"
+        {
+            over "collision"
+            {
+                token visibility = "invisible"
+            }
+        }
+    }
+
+    def Xform "Splat"
+    {
+        matrix4d xformOp:transform = ( (7.233397907929207, -0.9344113085205717, -0.046221654301245585, 0), (0.9332093136568176, 7.231953380726116, -0.15897249711721886, 0), (0.06619697933592024, 0.15174497295590716, 7.2917686746497274, 0), (1.0949818842734795, -1.8757884628616837, 1.200196307930352, 1) )
+        uniform token[] xformOpOrder = ["xformOp:transform"]
+
+        def "gaussians" (
+            prepend references = @corridor_splat_ut_gsframe.usdc@</corridor_splat>
+        )
+        {
+        }
+    }
+}
+

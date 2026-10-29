@@ -21,6 +21,7 @@ parser.add_argument("--num_objects", type=int, default=10, help="balls dropped a
 parser.add_argument("--steps", type=int, default=480, help="physics steps (dt = 1/120 s)")
 parser.add_argument("--save_dir", default=None, help="save RGB renders from recorded camera poses here")
 parser.add_argument("--num_views", type=int, default=4, help="camera views to render per recording")
+parser.add_argument("--views", default=None, help="camera views JSON (default: <scene>.views.json)")
 parser.add_argument("--render_frames", type=int, default=64, help="RTX accumulation frames per view (more = less noise)")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -42,9 +43,11 @@ from isaaclab.sensors.camera import Camera, CameraCfg
 from pxr import UsdGeom
 
 BALL_RADIUS = 0.1
-# ZED left camera (rectified 1280x720, fx = 528 px) -> pinhole with the same horizontal FOV
-IMG_W, IMG_H, FX = 1280, 720, 528.05
-APERTURE = 20.955
+# ZED left camera, rectified 1280x720 (camera_info of the bags). Its principal point sits 7 px below the
+# image centre, but Omniverse ignores aperture offsets, so render 2*7 rows taller (principal point at the
+# centre of the taller image) and crop the top IMG_H rows. cx is within 0.6 px of the centre.
+IMG_W, IMG_H, FX, CX, CY = 1280, 720, 528.05, 639.45, 367.07
+PAD = int(round(2 * (CY - IMG_H / 2)))
 
 
 def design_scene(views: dict) -> tuple[RigidObject, Camera | None]:
@@ -78,17 +81,19 @@ def design_scene(views: dict) -> tuple[RigidObject, Camera | None]:
         sim_utils.create_prim("/World/CamRig", "Xform")
         camera = Camera(CameraCfg(
             prim_path="/World/CamRig/Camera",
-            update_period=0, height=IMG_H, width=IMG_W, data_types=["rgb"],
+            update_period=0, height=IMG_H + PAD, width=IMG_W, data_types=["rgb"],
             renderer_cfg=IsaacRtxRendererCfg(),
-            spawn=sim_utils.PinholeCameraCfg(
-                focal_length=APERTURE * FX / IMG_W, horizontal_aperture=APERTURE, clipping_range=(0.05, 100.0)
+            spawn=sim_utils.PinholeCameraCfg.from_intrinsic_matrix(
+                intrinsic_matrix=[FX, 0.0, IMG_W / 2, 0.0, FX, (IMG_H + PAD) / 2, 0.0, 0.0, 1.0],
+                width=IMG_W, height=IMG_H + PAD,
+                clipping_range=(0.05, 100.0),
             ),
         ))
     return balls, camera
 
 
 def main():
-    views = json.load(open(args.scene + ".views.json"))
+    views = json.load(open(args.views or args.scene + ".views.json"))
     sim = sim_utils.SimulationContext(sim_utils.SimulationCfg(dt=1.0 / 120.0, device=args.device))
     balls, camera = design_scene(views)
     eye0 = views["h3"][0]
@@ -113,20 +118,23 @@ def main():
     if camera is not None:
         os.makedirs(args.save_dir, exist_ok=True)
         import imageio.v2 as imageio
-        for rec in ("h1", "h3"):
-            for k in np.linspace(0, len(views[rec]) - 1, args.num_views).astype(int):
+        for rec in views:
+            for k in np.unique(np.linspace(0, len(views[rec]) - 1, args.num_views).astype(int)):
                 v = views[rec][k]
                 camera.set_world_poses_from_view(torch.tensor([v["eye"]], device=sim.device),
                                                  torch.tensor([v["target"]], device=sim.device))
                 for _ in range(args.render_frames):  # path-traced gaussians need many subframes
                     sim.render()
                 camera.update(dt=0.0)
-                rgb = camera.data.output["rgb"][0].cpu().numpy()
+                rgb = camera.data.output["rgb"][0].cpu().numpy()[:IMG_H]  # principal point -> (cx, cy)
                 name = v["image"].replace("/", "_").replace(".jpg", ".png")
                 imageio.imwrite(os.path.join(args.save_dir, name), rgb)
                 print("[corridor] saved", name, "mean rgb", rgb.reshape(-1, rgb.shape[-1]).mean(0).round(1).tolist())
 
-    if app_launcher.has_window:
+    viz = getattr(args, "visualizer", None) or []
+    viz = viz.split(",") if isinstance(viz, str) else list(viz)
+    if app_launcher.has_window or "kit" in viz:  # keep the window open until the user closes it
+        print("[corridor] window open - close it to exit")
         while simulation_app.is_running():
             sim.step()
 

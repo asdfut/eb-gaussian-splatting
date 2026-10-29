@@ -13,7 +13,7 @@ alignment and a joint COLMAP bundle adjustment, then trained with [gsplat](https
 
 All models are evaluated on held-out frames (every 8th image). Trained models (`.ply` / `.pt`) and
 fly-through videos are attached to the [Releases](../../releases) page (v1.0: default strategy,
-v1.1: MCMC, v1.2: collision map / LiDAR point cloud, v1.3: splat USD for Isaac Sim).
+v1.1: MCMC, v1.2: collision map / LiDAR point cloud, v1.3: splat USD for Isaac Sim, v1.4: MCMC + 3DGUT).
 
 | Model | Images | Steps | PSNR ↑ | SSIM ↑ | LPIPS ↓ | #Gaussians |
 |---|---|---|---|---|---|---|
@@ -159,6 +159,8 @@ python load_corridor_scene.py --viz kit              # interactive window
 python load_corridor_scene.py --save_dir renders/    # headless: collision check + RGB renders
 #   --show_collision  draw the collision mesh   --render_frames N  RTX accumulation per view (default 64)
 #   --num_objects N   balls dropped on the floor --num_views N     views rendered per recording
+#   --scene corridor_scene_ut.usda  use the 3DGUT model (download corridor_splat_ut_gsframe.usdc from v1.4)
+#   --views my_views.json           render your own eye/target camera poses
 ```
 
 The script drops balls along the robot path and checks they come to rest on the floor, then renders
@@ -181,6 +183,7 @@ from the same pose. Rendered with `--render_frames 256`.*
 | `isaac/load_corridor_scene.py` | Isaac Lab loader / collision check / renderer |
 | `isaac/make_scene_usd.py` | Rebuilds `corridor_scene.usda` (run with an interpreter that has `pxr`) |
 | Release v1.3: `corridor_splat_gsframe.usdc` | MCMC model (1 M Gaussians) converted with NVIDIA's `omni.kit.converter.gsplat`, in gsplat's normalized frame |
+| `isaac/corridor_scene_ut.usda` + Release v1.4: `corridor_splat_ut_gsframe.usdc` | Same scene with the MCMC + 3DGUT model (see the experiment below) |
 
 **Things that matter (each one cost a debugging round):**
 
@@ -191,9 +194,37 @@ from the same pose. Rendered with `--render_frames 256`.*
   carries the transform makes the local `Xform` type win over `ParticleField3DGaussianSplat`, and nothing renders.
 - The splat is placed with a transform instead of baking it into the data, which would also require rotating
   every spherical-harmonics coefficient.
+- The ZED principal point is 7 px below the image centre, but **Omniverse ignores camera aperture offsets**
+  (Isaac Lab warns about it). The loader renders 14 rows taller with a centred principal point and crops the
+  top 720 rows; this raised PSNR against the real photos by ~1.3 dB.
 - Path-traced splats are grainier than gsplat's rasterizer; raise `--render_frames` for cleaner images.
 - The floor plane is flat, while the reconstruction drifts slightly in height: the splat floor is within ~8 cm of
   z = 0 almost everywhere, and up to ~15 cm below it near the start of `h1`.
+
+### Experiment: training with 3DGUT for Isaac's ray-traced renderer
+
+Isaac Sim evaluates Gaussians in 3D along rays, while gsplat trains by default with 2D-projected
+rasterization. To make training match the renderer, the MCMC model was retrained with gsplat's 3DGUT mode
+(`--with-ut --with-eval3d`, everything else identical; `--disable-video` is required because gsplat's 3D
+evaluation only supports RGB, so the RGB+depth trajectory render aborts).
+
+| 4 fps, MCMC, 50k steps | gsplat eval PSNR / SSIM / LPIPS | Isaac render vs photo, 8 recorded views: PSNR / SSIM |
+|---|---|---|
+| MCMC (v1.1) | **30.50** / 0.926 / **0.275** | **23.88** / **0.741** |
+| MCMC + 3DGUT (v1.4) | 30.28 / 0.925 / 0.279 | 23.47 / 0.729 |
+
+![MCMC vs 3DGUT in Isaac Sim](assets/isaac_mcmc_vs_3dgut.jpg)
+
+*Isaac Sim renders (256 frames). Rows 1–2: recorded views with the photo. Rows 3–5: off-trajectory views
+(0.6 m high, turned ±60° towards the walls), where no photo exists.*
+
+**Result: no clear gain.** 3DGUT is on par in gsplat and 0.4 dB lower in Isaac at recorded views; off the
+trajectory it is somewhat cleaner in some views (rows 3 and 5) and shows more floor speckle in others
+(row 1). The default scene therefore keeps the MCMC model; the 3DGUT one is available as
+`isaac/corridor_scene_ut.usda` (splat USD in Release v1.4). The remaining gap to gsplat's own renderer
+(~24 vs ~30 dB) comes from Isaac's path-traced Gaussian rendering (noise / speckle); blur in
+off-trajectory views comes from the data (only two camera heights, all looking along the corridor) and
+needs more coverage or geometric supervision (e.g. LiDAR depth), not a different renderer.
 
 To convert another `.ply` (standard 3DGS layout, e.g. any gsplat export):
 
@@ -270,6 +301,7 @@ results/
   joint_2fps/       cfg.yml + val/train stats
   joint_4fps/       cfg.yml + val/train stats
   joint_4fps_mcmc/  cfg.yml + val/train stats (MCMC, best model)
+  joint_4fps_mcmc_ut/ cfg.yml + val/train stats (MCMC + 3DGUT)
   ablation_4fps_7k/ A–D ablation configs and stats
   ablation_mcmc_7k/ M1–M4, N1 MCMC stability ablation
   alignment/        h3→h1 rigid transform
