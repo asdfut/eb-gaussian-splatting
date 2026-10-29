@@ -13,7 +13,7 @@ alignment and a joint COLMAP bundle adjustment, then trained with [gsplat](https
 
 All models are evaluated on held-out frames (every 8th image). Trained models (`.ply` / `.pt`) and
 fly-through videos are attached to the [Releases](../../releases) page (v1.0: default strategy,
-v1.1: MCMC).
+v1.1: MCMC, v1.2: collision map / LiDAR point cloud).
 
 | Model | Images | Steps | PSNR ↑ | SSIM ↑ | LPIPS ↓ | #Gaussians |
 |---|---|---|---|---|---|---|
@@ -83,6 +83,65 @@ A first "improved" run that combined `pose_opt + app_opt + absgrad + bilateral g
 is the culprit** on this low-texture scene; `pose_opt` / `app_opt` bring no gain because the joint BA poses
 are already accurate and exposure is consistent across the two sessions. The bilateral grid was dropped for
 speed: its TV regulariser runs over every image's grid each step (~190 ms/step with 1791 images).
+
+## Collision map (for simulation)
+
+A metric **3D collision mesh** built from the Livox Mid-360 LiDAR in the bags (not from the Gaussians:
+3DGS geometry has fake surfaces under the reflective floor and floaters near white walls). It lives in a
+gravity-levelled frame with the **floor at z = 0**, and lines up with the Gaussian splatting scene through
+the provided transforms, so the 3DGS model can be used as the visual and this mesh as the collider.
+
+| File | Description |
+|---|---|
+| [`collision/collision_mesh.usd`](collision/collision_mesh.usd) | **Isaac Sim / Isaac Lab** static collider (Z-up, metres, `UsdPhysics.CollisionAPI`, exact triangle mesh), 397 k triangles |
+| [`collision/collision_mesh.obj`](collision/collision_mesh.obj) | Same mesh as OBJ (Gazebo, MuJoCo, Blender, …) |
+| [`collision/floor.obj`](collision/floor.obj) | Flat floor grid at z = 0 (already included in the two files above) |
+| [`collision/T_gsplat_from_sim.txt`](collision/T_gsplat_from_sim.txt) | 4×4 similarity, `x_gsplat = T @ x_sim` — maps the collision frame into the frame of the 3DGS `.ply` / checkpoints |
+| [`collision/T_sim_from_ba.txt`](collision/T_sim_from_ba.txt) | 4×4, COLMAP/BA world (metric) → collision frame |
+| `collision/T_camlink_livox_{h1,h3}.txt` | Estimated Livox → `zed_camera_link` extrinsics per session |
+| [`collision/stats.json`](collision/stats.json) | All numbers below |
+| Release v1.2: `lidar_map_2cm.ply`, `collision_mesh_full.ply`, `collision_mesh_nofloor.obj` | 12 M-point fused LiDAR cloud, 13.7 M-triangle full-resolution mesh, mesh without the floor grid |
+
+To place the Gaussian scene in the simulator, apply `inv(T_gsplat_from_sim)` to the 3DGS `.ply` (it is a
+similarity: rotation + translation + scale 0.137). Verified: camera centres mapped through the transforms
+match gsplat's own cameras to 7·10⁻⁷ m.
+
+![collision map top and side view](assets/collision_top_side.jpg)
+
+*Left: obstacles 0.3–1.5 m above the floor (top view). Right: 6 m-wide side slab — floor flat at z = 0,
+ceiling level at ~2.7 m, doors/windows visible.*
+
+![collision mesh projected into camera images](assets/collision_overlay.jpg)
+
+*Collision mesh projected into real camera frames with the camera poses (colour = depth). Walls, ceiling,
+doors and stairs line up with the images, i.e. the mesh is registered to the camera / 3DGS geometry.*
+
+### How it is built (`scripts/build_lidar_map.py`)
+
+1. **LiDAR extraction** — `/livox/lidar` (CustomMsg) parsed straight from CDR bytes (87 M points, < 5 s per bag).
+2. **Extrinsic** — `tf_static` has no Livox transform, so `calib_lidar.py` estimates it: yaw grid search against
+   the SfM points, then iterative point-to-plane ICP of LiDAR submaps. **Per session**, because the rigs differ:
+   *h3 was recorded with the sensors ~1.2 m higher than h1* (h1 Livox is 10.5 cm above the floor).
+3. **Poses** — ZED VIO (30 Hz) corrected by the joint-BA poses (interpolated per image), per-point deskew.
+4. **Levelling** — the BA world is tilted 2.78° (planar camera paths, ZED map frame not gravity aligned);
+   levelled with the h1 camera-path plane.
+5. **Clean-up** — robot body/mount points (sensor-frame voxels occupied in > 50 % of a session's scans,
+   0.8 M points); **mirror returns** below the shiny floor (1.6 M); **moving objects** (the operator walking
+   next to the robot) by per-session free-space carving within 1.5 m of the path (2.9 M).
+6. **Registration** — h3 → h1 ICP (overlap within 10 cm 75.4 % → 79.9 %, RMSE 4.1 → 3.8 cm), then LiDAR →
+   SfM ICP (SfM points within 5 cm of the LiDAR map 37 % → 52 %, within 10 cm 60 % → 69 %).
+7. **Mesh** — Poisson (depth 11) trimmed to observed areas, decimated to ~383 k triangles, plus a flat
+   0.5 m floor grid (the 9–10 cm high Mid-360 sees the shiny floor only at grazing angles, so floor returns
+   are too sparse to mesh); USD via `mesh_to_usd.py` (needs `pxr`, e.g. the Isaac Lab env).
+
+### Limitations
+
+- **Glass** (windows, glass doors) is mostly invisible to LiDAR, so the mesh may be open there.
+- Doors are frozen in the state they were in during recording.
+- The floor is an idealised plane; ramps/steps on the floor are not modelled (stairs are, from LiDAR).
+- Some walls still show a few-cm double surface from residual misalignment; fine for collision,
+  not for precise measurement.
+- A faint ghost of the operator may remain where they stood still for a long time.
 
 ## Pipeline
 
@@ -155,5 +214,6 @@ results/
   ablation_4fps_7k/ A–D ablation configs and stats
   ablation_mcmc_7k/ M1–M4, N1 MCMC stability ablation
   alignment/        h3→h1 rigid transform
+collision/          collision mesh (USD / OBJ), floor, frame transforms, stats
 assets/             figures used in this README
 ```

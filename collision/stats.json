@@ -1,0 +1,60 @@
+{
+  "level_tilt_removed_deg": 2.779,
+  "h1_body_points_removed": 621831,
+  "h1_sensor_height_z_median": 0.292,
+  "h3_body_points_removed": 191113,
+  "h3_sensor_height_z_median": 1.45,
+  "points_fused": 21538404,
+  "floor_z": 0.187,
+  "h1_sensor_above_floor_m": 0.105,
+  "h1_mirror_points_removed": 1469856,
+  "h1_dynamic_points_removed": 2107943,
+  "h3_mirror_points_removed": 170487,
+  "h3_dynamic_points_removed": 801166,
+  "h3_to_h1_icp": {
+    "translation_m": [
+      -0.046,
+      -0.001,
+      0.102
+    ],
+    "rotation_deg": 0.497,
+    "overlap@10cm": [
+      0.754,
+      0.799
+    ],
+    "rmse_m": [
+      0.041,
+      0.038
+    ]
+  },
+  "lidar_to_sfm": {
+    "translation_m": [
+      -0.05,
+      0.099,
+      -0.167
+    ],
+    "rotation_deg": 0.124,
+    "sfm_within_5cm": [
+      0.37,
+      0.524
+    ],
+    "sfm_within_10cm": [
+      0.6,
+      0.689
+    ]
+  },
+  "points_final": 12156029,
+  "mesh_triangles": 13733177,
+  "collision_triangles": 396988,
+  "floor_triangles": 13680,
+  "bbox_min": [
+    -22.29,
+    -16.82,
+    -0.08
+  ],
+  "bbox_max": [
+    30.86,
+    21.58,
+    6.39
+  ]
+}

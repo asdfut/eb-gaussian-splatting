@@ -11,7 +11,7 @@ COLMAP 聯合光束法平差（bundle adjustment）融合成同一個場景，�
 ## 結果
 
 所有模型都在保留的測試影像（每 8 張取 1 張）上評估。訓練好的模型（`.ply` / `.pt`）與漫遊影片放在
-[Releases](../../releases) 頁面（v1.0：預設策略；v1.1：MCMC）。
+[Releases](../../releases) 頁面（v1.0：預設策略；v1.1：MCMC；v1.2：碰撞地圖 / LiDAR 點雲）。
 
 | 模型 | 影像數 | 步數 | PSNR ↑ | SSIM ↑ | LPIPS ↓ | 高斯數 |
 |---|---|---|---|---|---|---|
@@ -77,6 +77,64 @@ M4 顯示崩壞和合併兩段錄影無關。
 大量漂浮物，見 `assets/failed_absgrad_combo_7k.jpg`）。消融實驗顯示，在這個低紋理場景中 **absgrad 是元兇**；
 `pose_opt` / `app_opt` 沒有幫助，因為聯合 BA 後的位姿已經很準，兩段錄影的曝光也一致。bilateral grid 因為
 速度被拿掉：它的 TV 正則項每一步都會對全部影像的網格計算（1791 張時約 190 ms/步）。
+
+## 碰撞地圖（給模擬用）
+
+用 bag 裡的 Livox Mid-360 LiDAR 建立的公制 **3D 碰撞網格**。沒有從高斯模型取幾何，因為 3DGS 在反光地板
+下方會有假表面，白牆附近也有漂浮物。網格位在重力校正後的座標系，**地板在 z = 0**，並且透過附上的轉換矩陣
+和高斯潑濺場景對齊，因此可以用 3DGS 模型當外觀、用這個網格當碰撞體。
+
+| 檔案 | 說明 |
+|---|---|
+| [`collision/collision_mesh.usd`](collision/collision_mesh.usd) | **Isaac Sim / Isaac Lab** 靜態碰撞體（Z 軸朝上、單位公尺、`UsdPhysics.CollisionAPI`、精確三角網格），39.7 萬個三角形 |
+| [`collision/collision_mesh.obj`](collision/collision_mesh.obj) | 同一個網格的 OBJ 版本（Gazebo、MuJoCo、Blender 等） |
+| [`collision/floor.obj`](collision/floor.obj) | z = 0 的平面地板網格（上面兩個檔案已經包含） |
+| [`collision/T_gsplat_from_sim.txt`](collision/T_gsplat_from_sim.txt) | 4×4 相似轉換，`x_gsplat = T @ x_sim`：把碰撞座標系轉到 3DGS `.ply` / checkpoint 的座標系 |
+| [`collision/T_sim_from_ba.txt`](collision/T_sim_from_ba.txt) | 4×4，COLMAP/BA 世界座標（公制）→ 碰撞座標系 |
+| `collision/T_camlink_livox_{h1,h3}.txt` | 各段錄影估出的 Livox → `zed_camera_link` 外參 |
+| [`collision/stats.json`](collision/stats.json) | 下面所有數字的來源 |
+| Release v1.2：`lidar_map_2cm.ply`、`collision_mesh_full.ply`、`collision_mesh_nofloor.obj` | 1200 萬點的融合 LiDAR 點雲、1370 萬個三角形的完整網格、沒有地板網格的版本 |
+
+要把高斯場景放進模擬器，對 3DGS 的 `.ply` 套用 `inv(T_gsplat_from_sim)` 即可（這是相似轉換：旋轉 + 平移
++ 縮放 0.137）。已驗證：相機中心經過這些轉換後，和 gsplat 自己的相機位置相差 7·10⁻⁷ m。
+
+![碰撞地圖俯視與側視圖](assets/collision_top_side.jpg)
+
+*左：地板以上 0.3–1.5 m 的障礙物（俯視）。右：6 m 寬的側視切片——地板在 z = 0 是平的，天花板約在 2.7 m
+也是水平的，可以看到門和窗戶。*
+
+![碰撞網格投影到相機影像](assets/collision_overlay.jpg)
+
+*用相機位姿把碰撞網格投影到真實影像上（顏色代表深度）。牆面、天花板、門和樓梯都和影像對齊，表示網格和
+相機 / 3DGS 的幾何是對準的。*
+
+### 建立方式（`scripts/build_lidar_map.py`）
+
+1. **抽取 LiDAR**：`/livox/lidar`（CustomMsg）直接從 CDR 位元組解析（8700 萬點，每個 bag 不到 5 秒）。
+2. **外參**：`tf_static` 裡沒有 Livox 的轉換，所以由 `calib_lidar.py` 估計：先對 SfM 點做 yaw 網格搜尋，
+   再對 LiDAR 子地圖反覆做 point-to-plane ICP。**每段錄影分開估計**，因為兩次的安裝方式不同：
+   *h3 錄影時感測器比 h1 高約 1.2 m*（h1 的 Livox 離地 10.5 cm）。
+3. **位姿**：ZED VIO（30 Hz）加上聯合 BA 位姿的修正量（依影像時間內插），並逐點去畸變。
+4. **水平校正**：BA 世界座標傾斜 2.78°（相機路徑是平面，但 ZED 的 map 座標系沒有對齊重力），
+   用 h1 相機路徑的平面來校正。
+5. **清理**：
+   - 機器人本體和支架的點：在感測器座標中，被同一段錄影超過 50% 的掃描佔據的體素，共 80 萬點。
+   - 反光地板下方的**鏡像點**，共 160 萬點。
+   - **移動物體**（跟在機器人旁邊的操作人員）：每段錄影各自做射線雕刻，只雕刻路徑 1.5 m 內的範圍，
+     共 290 萬點。
+6. **對齊**：h3 → h1 ICP（10 cm 內重疊 75.4% → 79.9%，RMSE 4.1 → 3.8 cm），再做 LiDAR → SfM ICP
+   （離 LiDAR 地圖 5 cm 內的 SfM 點 37% → 52%，10 cm 內 60% → 69%）。
+7. **網格**：Poisson 重建（depth 11），剪掉沒有觀測的區域，簡化成約 38.3 萬個三角形，再加上 0.5 m 網格的
+   平面地板。離地只有 9–10 cm 的 Mid-360 只能以掠射角看到反光地板，地板點太稀疏，無法直接建成網格。
+   USD 由 `mesh_to_usd.py` 產生（需要 `pxr`，例如 Isaac Lab 的環境）。
+
+### 限制
+
+- **玻璃**（窗戶、玻璃門）LiDAR 大多看不到，網格在那些地方可能是開口。
+- 門的狀態固定在錄影當時（開或關）。
+- 地板是理想化的平面，地面上的坡道或台階沒有建模（樓梯有，來自 LiDAR）。
+- 部分牆面因為殘留的對齊誤差，仍有幾公分的雙層表面；用於碰撞沒問題，但不適合精確量測。
+- 操作人員長時間站著不動的地方，可能還留有淡淡的殘影。
 
 ## 流程
 
@@ -148,5 +206,6 @@ results/
   ablation_4fps_7k/ A–D 消融實驗的設定與統計
   ablation_mcmc_7k/ M1–M4、N1 MCMC 穩定性消融實驗
   alignment/        h3→h1 剛體轉換
+collision/          碰撞網格（USD / OBJ）、地板、座標轉換、統計
 assets/             README 使用的圖片
 ```

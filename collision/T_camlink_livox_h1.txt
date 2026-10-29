@@ -1,0 +1,5 @@
+# Livox extrinsic for session h1: x_zed_camera_link = T @ x_livox_frame (z translation weakly observable, fixed globally by LiDAR->SfM ICP)
+0.999319 -0.001537 0.036856 -0.008556
+0.002101 0.999881 -0.015292 0.055966
+-0.036828 0.015359 0.999204 0.064198
+0.000000 0.000000 0.000000 1.000000
